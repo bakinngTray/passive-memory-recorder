@@ -5,7 +5,9 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.*;
+import android.provider.Settings;
 import android.view.*;
 import android.widget.*;
 import java.util.*;
@@ -15,6 +17,7 @@ public class MainActivity extends Activity {
     private TextView status;
     private Button start;
     private Button stop;
+    private boolean batteryPromptRequested=false;
 
     @Override protected void onCreate(Bundle b){
         super.onCreate(b);
@@ -27,6 +30,7 @@ public class MainActivity extends Activity {
         super.onResume();
         refresh();
         if(hasMic()&&!Prefs.isRecording(this)) NotificationHelper.stopped(this,"Микрофон не записывает.");
+        if(hasMic()) requestBatteryExemptionIfNeeded();
     }
 
     private void buildUi(){
@@ -55,6 +59,7 @@ public class MainActivity extends Activity {
 
     private void startRecording(){
         if(!hasMic()){ requestNeeded(); return; }
+        requestBatteryExemptionIfNeeded();
         startForegroundService(new Intent(this,RecordingService.class).setAction(RecordingService.ACTION_START));
         new Handler(Looper.getMainLooper()).postDelayed(this::refresh,600);
     }
@@ -80,9 +85,30 @@ public class MainActivity extends Activity {
         if(!ps.isEmpty())requestPermissions(ps.toArray(new String[0]),REQ);
     }
 
+    private void requestBatteryExemptionIfNeeded(){
+        if(Build.VERSION.SDK_INT<Build.VERSION_CODES.M || batteryPromptRequested) return;
+        PowerManager pm=(PowerManager)getSystemService(POWER_SERVICE);
+        if(pm==null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+
+        batteryPromptRequested=true;
+        try{
+            Intent intent=new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            intent.setData(Uri.parse("package:"+getPackageName()));
+            startActivity(intent);
+        }catch(Exception ignored){
+            try{
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            }catch(Exception ignoredToo){ }
+        }
+    }
+
     @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){
         super.onRequestPermissionsResult(r,p,g);
-        if(r==REQ){ refresh(); if(hasMic()&&!Prefs.isRecording(this))NotificationHelper.stopped(this,"Микрофон не записывает."); }
+        if(r==REQ){
+            refresh();
+            if(hasMic()&&!Prefs.isRecording(this))NotificationHelper.stopped(this,"Микрофон не записывает.");
+            if(hasMic())requestBatteryExemptionIfNeeded();
+        }
     }
 
     private LinearLayout.LayoutParams lp(){ LinearLayout.LayoutParams x=new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.WRAP_CONTENT); x.setMargins(0,dp(8),0,dp(8)); return x; }
