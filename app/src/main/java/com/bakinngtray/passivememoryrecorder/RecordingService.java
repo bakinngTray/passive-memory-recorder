@@ -86,6 +86,7 @@ public class RecordingService extends Service {
 
     private synchronized void switched(){
         finalizeItem(currentUri); close(initialPfd); initialPfd=null;
+        UploadScheduler.schedule(this);
         currentUri=nextUri; nextUri=null;
         rename(currentUri,fileNameNow());
     }
@@ -96,6 +97,7 @@ public class RecordingService extends Service {
         close(initialPfd); initialPfd=null;
         finalizeItem(currentUri); currentUri=null;
         delete(nextUri); nextUri=null;
+        UploadScheduler.schedule(this);
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf();
         NotificationHelper.stopped(this,reason);
     }
@@ -106,6 +108,7 @@ public class RecordingService extends Service {
         close(initialPfd); initialPfd=null;
         finalizeItem(currentUri); currentUri=null;
         delete(nextUri); nextUri=null;
+        UploadScheduler.schedule(this);
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf();
         NotificationHelper.stopped(this,reason);
     }
@@ -130,7 +133,14 @@ public class RecordingService extends Service {
 
     @Override public void onDestroy(){
         boolean active=recorder!=null;
-        if(active){ try{recorder.stop();}catch(RuntimeException ignored){} recorder.release(); recorder=null; close(initialPfd); finalizeItem(currentUri); delete(nextUri); }
+        if(active){
+            try{recorder.stop();}catch(RuntimeException ignored){}
+            recorder.release(); recorder=null;
+            close(initialPfd);
+            finalizeItem(currentUri);
+            delete(nextUri);
+            UploadScheduler.schedule(this);
+        }
         if(active&&!intentionalStop){ Prefs.stopped(this); NotificationHelper.stopped(this,"Запись неожиданно остановилась."); }
         super.onDestroy();
     }
