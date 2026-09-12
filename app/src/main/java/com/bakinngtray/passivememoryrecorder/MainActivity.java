@@ -14,7 +14,9 @@ import java.util.*;
 
 public class MainActivity extends Activity {
     private static final int REQ=100;
+    private static final int REQ_UPLOAD_FOLDER=200;
     private TextView status;
+    private TextView uploadStatus;
     private Button start;
     private Button stop;
     private boolean batteryPromptRequested=false;
@@ -51,10 +53,25 @@ public class MainActivity extends Activity {
         start=new Button(this); start.setText("ВКЛЮЧИТЬ ЗАПИСЬ"); start.setOnClickListener(v->startRecording()); root.addView(start,lp());
         stop=new Button(this); stop.setText("Остановить запись"); stop.setOnClickListener(v->stopRecording()); root.addView(stop,lp());
 
+        uploadStatus=new TextView(this);
+        uploadStatus.setTextSize(15); uploadStatus.setPadding(0,dp(24),0,dp(4)); uploadStatus.setGravity(Gravity.CENTER_HORIZONTAL);
+        root.addView(uploadStatus,lp());
+
+        Button chooseUploadFolder=new Button(this);
+        chooseUploadFolder.setText("ВЫБРАТЬ ПАПКУ В GOOGLE DRIVE");
+        chooseUploadFolder.setOnClickListener(v->chooseUploadFolder());
+        root.addView(chooseUploadFolder,lp());
+
         TextView info=new TextView(this);
-        info.setText("Файлы: Internal storage / Music / PassiveMemoryRecorder\n\nAAC/M4A, mono, автоматическая ротация примерно раз в час.");
-        info.setTextSize(15); info.setPadding(0,dp(28),0,0); root.addView(info,lp());
+        info.setText("Локальные файлы: Internal storage / Music / PassiveMemoryRecorder\n\nAAC/M4A, mono, автоматическая ротация примерно раз в час. После завершения каждого файла приложение пытается отправить все готовые записи в выбранную папку Google Drive. Локальный файл удаляется только после успешного полного копирования.");
+        info.setTextSize(15); info.setPadding(0,dp(20),0,0); root.addView(info,lp());
         setContentView(root);
+    }
+
+    private void chooseUploadFolder(){
+        Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION|Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        startActivityForResult(intent,REQ_UPLOAD_FOLDER);
     }
 
     private void startRecording(){
@@ -74,6 +91,7 @@ public class MainActivity extends Activity {
         status.setText(on?"● ЗАПИСЬ АКТИВНА":"● ЗАПИСЬ ВЫКЛЮЧЕНА");
         status.setTextColor(on?Color.rgb(0,120,60):Color.rgb(190,20,20));
         start.setEnabled(!on); stop.setEnabled(on);
+        uploadStatus.setText(Prefs.getUploadTreeUri(this)==null?"Google Drive: папка не выбрана":"Google Drive: папка выбрана");
     }
 
     private boolean hasMic(){ return checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED; }
@@ -100,6 +118,22 @@ public class MainActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
             }catch(Exception ignoredToo){ }
         }
+    }
+
+    @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
+        super.onActivityResult(requestCode,resultCode,data);
+        if(requestCode!=REQ_UPLOAD_FOLDER||resultCode!=RESULT_OK||data==null||data.getData()==null)return;
+        Uri uri=data.getData();
+        int flags=data.getFlags()&(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try{
+            getContentResolver().takePersistableUriPermission(uri,flags);
+            Prefs.setUploadTreeUri(this,uri);
+            UploadScheduler.schedule(this);
+            Toast.makeText(this,"Папка выбрана. Готовые записи будут отправляться автоматически.",Toast.LENGTH_LONG).show();
+        }catch(Exception e){
+            Toast.makeText(this,"Не удалось сохранить доступ к папке.",Toast.LENGTH_LONG).show();
+        }
+        refresh();
     }
 
     @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){
