@@ -17,13 +17,15 @@ import java.util.*;
 public class RecordingService extends Service {
     static final String ACTION_START="com.bakinngtray.passivememoryrecorder.START";
     static final String ACTION_STOP="com.bakinngtray.passivememoryrecorder.STOP";
-    private static final long ROTATION_BYTES=22_000_000L;
+    private static final long SEGMENT_MS=60L*60L*1000L;
     private static final String PATH="Music/PassiveMemoryRecorder";
+
+    private final Handler rotationHandler=new Handler(Looper.getMainLooper());
+    private final Runnable rotationRunnable=this::rotateSegment;
 
     private MediaRecorder recorder;
     private Uri currentUri;
-    private Uri nextUri;
-    private ParcelFileDescriptor initialPfd;
+    private ParcelFileDescriptor currentPfd;
     private boolean intentionalStop;
 
     @Override public void onCreate(){ super.onCreate(); NotificationHelper.channels(this); }
@@ -46,68 +48,86 @@ public class RecordingService extends Service {
             startForeground(NotificationHelper.RECORDING_ID,NotificationHelper.recording(this));
         }
         try{
-            currentUri=createPending(fileNameNow());
-            initialPfd=getContentResolver().openFileDescriptor(currentUri,"rw");
-            if(initialPfd==null)throw new IOException("Не удалось открыть выходной файл");
-            recorder=Build.VERSION.SDK_INT>=31?new MediaRecorder(this):new MediaRecorder();
-            recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
-            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-            recorder.setAudioChannels(1);
-            recorder.setAudioSamplingRate(44_100);
-            recorder.setAudioEncodingBitRate(48_000);
-            recorder.setMaxFileSize(ROTATION_BYTES);
-            recorder.setOutputFile(initialPfd.getFileDescriptor());
-            recorder.setOnInfoListener(this::onInfo);
-            recorder.setOnErrorListener((mr,what,extra)->fail("Запись неожиданно остановилась (ошибка "+what+")."));
-            recorder.prepare();
-            recorder.start();
+            beginSegment();
             Prefs.started(this);
+            scheduleRotation();
         }catch(Exception e){ fail("Не удалось начать запись: "+safe(e)); }
     }
 
-    private synchronized void onInfo(MediaRecorder mr,int what,int extra){
-        if(what==MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_APPROACHING){ prepareNext(mr); }
-        else if(what==MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED){ switched(); }
-        else if(what==MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED){ fail("Не удалось подготовить следующий файл."); }
-    }
+    private void beginSegment() throws Exception {
+        currentUri=createPending(fileNameNow());
+        currentPfd=getContentResolver().openFileDescriptor(currentUri,"rw");
+        if(currentPfd==null)throw new IOException("Не удалось открыть выходной файл");
 
-    private void prepareNext(MediaRecorder mr){
-        if(nextUri!=null)return;
-        ParcelFileDescriptor pfd=null;
+        MediaRecorder next=Build.VERSION.SDK_INT>=31?new MediaRecorder(this):new MediaRecorder();
         try{
-            nextUri=createPending("PMR_pending_"+System.currentTimeMillis()+".m4a");
-            pfd=getContentResolver().openFileDescriptor(nextUri,"rw");
-            if(pfd==null)throw new IOException("Не удалось открыть следующий файл");
-            mr.setNextOutputFile(pfd.getFileDescriptor());
-            pfd.close();
-        }catch(Exception e){ close(pfd); delete(nextUri); nextUri=null; fail("Не удалось продолжить запись: "+safe(e)); }
+            next.setAudioSource(MediaRecorder.AudioSource.MIC);
+            next.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            next.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            next.setAudioChannels(1);
+            next.setAudioSamplingRate(44_100);
+            next.setAudioEncodingBitRate(48_000);
+            next.setOutputFile(currentPfd.getFileDescriptor());
+            next.setOnErrorListener((mr,what,extra)->fail("Запись неожиданно остановилась (ошибка "+what+")."));
+            next.prepare();
+            next.start();
+            recorder=next;
+        }catch(Exception e){
+            try{ next.release(); }catch(Exception ignored){}
+            close(currentPfd); currentPfd=null;
+            delete(currentUri); currentUri=null;
+            throw e;
+        }
     }
 
-    private synchronized void switched(){
-        finalizeItem(currentUri); close(initialPfd); initialPfd=null;
+    private void scheduleRotation(){
+        rotationHandler.removeCallbacks(rotationRunnable);
+        rotationHandler.postDelayed(rotationRunnable,SEGMENT_MS);
+    }
+
+    private synchronized void rotateSegment(){
+        if(recorder==null)return;
+        rotationHandler.removeCallbacks(rotationRunnable);
+
+        try{
+            recorder.stop();
+        }catch(RuntimeException e){
+            fail("Не удалось завершить часовой файл: "+safe(e));
+            return;
+        }
+        recorder.release(); recorder=null;
+        close(currentPfd); currentPfd=null;
+        finalizeItem(currentUri); currentUri=null;
+
+        // Closed files can be uploaded while the next hour is already recording.
         UploadScheduler.schedule(this);
-        currentUri=nextUri; nextUri=null;
-        rename(currentUri,fileNameNow());
+
+        try{
+            beginSegment();
+            scheduleRotation();
+        }catch(Exception e){
+            fail("Не удалось начать следующий час записи: "+safe(e));
+        }
     }
 
     private synchronized void stopAndNotify(String reason){
-        intentionalStop=true; Prefs.stopped(this);
-        if(recorder!=null){ try{ recorder.stop(); }catch(RuntimeException ignored){} recorder.reset(); recorder.release(); recorder=null; }
-        close(initialPfd); initialPfd=null;
+        intentionalStop=true;
+        rotationHandler.removeCallbacks(rotationRunnable);
+        Prefs.stopped(this);
+        if(recorder!=null){ try{ recorder.stop(); }catch(RuntimeException ignored){} recorder.release(); recorder=null; }
+        close(currentPfd); currentPfd=null;
         finalizeItem(currentUri); currentUri=null;
-        delete(nextUri); nextUri=null;
         UploadScheduler.schedule(this);
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf();
         NotificationHelper.stopped(this,reason);
     }
 
     private synchronized void fail(String reason){
+        rotationHandler.removeCallbacks(rotationRunnable);
         Prefs.stopped(this);
         if(recorder!=null){ try{ recorder.reset(); }catch(RuntimeException ignored){} recorder.release(); recorder=null; }
-        close(initialPfd); initialPfd=null;
+        close(currentPfd); currentPfd=null;
         finalizeItem(currentUri); currentUri=null;
-        delete(nextUri); nextUri=null;
         UploadScheduler.schedule(this);
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf();
         NotificationHelper.stopped(this,reason);
@@ -125,20 +145,19 @@ public class RecordingService extends Service {
     }
 
     private void finalizeItem(Uri u){ if(u==null)return; try{ ContentValues v=new ContentValues(); v.put(MediaStore.Audio.Media.IS_PENDING,0); getContentResolver().update(u,v,null,null); }catch(Exception ignored){} }
-    private void rename(Uri u,String n){ if(u==null)return; try{ ContentValues v=new ContentValues(); v.put(MediaStore.Audio.Media.DISPLAY_NAME,n); getContentResolver().update(u,v,null,null); }catch(Exception ignored){} }
     private void delete(Uri u){ if(u==null)return; try{ getContentResolver().delete(u,null,null); }catch(Exception ignored){} }
     private static void close(ParcelFileDescriptor p){ if(p==null)return; try{p.close();}catch(IOException ignored){} }
     private static String fileNameNow(){ return "PMR_"+new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss",Locale.US).format(new Date())+".m4a"; }
     private static String safe(Exception e){ String m=e.getMessage(); return m==null||m.trim().isEmpty()?e.getClass().getSimpleName():m; }
 
     @Override public void onDestroy(){
+        rotationHandler.removeCallbacks(rotationRunnable);
         boolean active=recorder!=null;
         if(active){
             try{recorder.stop();}catch(RuntimeException ignored){}
             recorder.release(); recorder=null;
-            close(initialPfd);
-            finalizeItem(currentUri);
-            delete(nextUri);
+            close(currentPfd); currentPfd=null;
+            finalizeItem(currentUri); currentUri=null;
             UploadScheduler.schedule(this);
         }
         if(active&&!intentionalStop){ Prefs.stopped(this); NotificationHelper.stopped(this,"Запись неожиданно остановилась."); }
